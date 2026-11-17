@@ -3160,6 +3160,179 @@ class ServerTests(TempBoard):
         self.assertEqual(text, kanvas.dumps(kanvas.parse_board(text)))
 
 
+class FakeEntryPoint:
+    """An entry point of the group kanvas.extensions that loads `module` (or raises `error`)."""
+
+    def __init__(self, name, module=None, error=None):
+        self.name, self.module, self.error = name, module, error
+
+    def load(self):
+        if self.error:
+            raise self.error
+        return self.module
+
+
+class FakeExtension:
+    """An extension module: `register` adds the routes and the script it was given."""
+
+    __version__ = "1.2.3"
+
+    def __init__(self, routes=None, script=None, error=None):
+        self.routes, self.script, self.error, self.api, self.calls = routes or {}, script, error, None, []
+
+    def register(self, api):
+        self.calls.append(api)
+        if self.error:
+            raise self.error
+        self.api = api
+        for subpath, handler in self.routes.items():
+            api.add_route(subpath, handler)
+        if self.script:
+            api.add_script(self.script)
+
+
+class ExtensionTests(TempBoard):
+    def setUp(self):
+        super().setUp()
+        self.server = kanvas.start_server(self.path, "127.0.0.1", 0, quiet=True)
+        self.port = self.server.server_address[1]
+        self.name = kanvas.board_name(self.path)
+        self.api = f"/{self.name}/api/board"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    request = ServerTests.request
+
+    def install(self, *entry_points, old_python=False):
+        """Makes `entry_points` the installed extensions, as Python 3.10 reports them or as 3.8 does."""
+        def modern(group=None):
+            return list(entry_points) if group == "kanvas.extensions" else []
+
+        def old(**kwargs):
+            if kwargs:
+                raise TypeError("entry_points() got an unexpected keyword argument")
+            return {"kanvas.extensions": list(entry_points), "console_scripts": []}
+
+        patcher = mock.patch("importlib.metadata.entry_points", old if old_python else modern)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        kanvas._extensions = None
+        self.addCleanup(setattr, kanvas, "_extensions", None)
+
+    def ext_list(self):
+        status, _, body = self.request("GET", f"/{self.name}/api/ext")
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def test_no_extension_gives_an_empty_list(self):
+        self.install()
+        self.assertEqual(self.ext_list(), {"api": 1, "extensions": []})
+
+    def test_discovery_reads_both_forms_of_entry_points(self):
+        for old_python in (False, True):
+            with self.subTest(old_python=old_python):
+                self.install(FakeEntryPoint("runtime", FakeExtension()), old_python=old_python)
+                self.assertEqual(self.ext_list()["extensions"], [{"name": "runtime", "version": "1.2.3", "script": False}])
+
+    def test_a_bad_name_is_skipped_with_one_log_line(self):
+        bad = FakeExtension()
+        self.install(FakeEntryPoint("Bad-Name", bad), FakeEntryPoint("good", FakeExtension()))
+        with mock.patch("sys.stderr", io.StringIO()) as err:
+            names = [e["name"] for e in self.ext_list()["extensions"]]
+        self.assertEqual(names, ["good"])
+        self.assertEqual(bad.calls, [])
+        self.assertEqual(err.getvalue().count("\n"), 1)
+        self.assertIn("Bad-Name", err.getvalue())
+
+    def test_extensions_load_once_in_order_of_their_names(self):
+        order = []
+        first, second = FakeExtension(), FakeExtension()
+        first.register = lambda api: order.append("a")
+        second.register = lambda api: order.append("b")
+        self.install(FakeEntryPoint("b", second), FakeEntryPoint("a", first))
+        self.ext_list()
+        self.ext_list()
+        self.assertEqual(order, ["a", "b"])
+
+    def test_a_route_gets_the_request(self):
+        seen = []
+
+        def handler(request):
+            seen.append(request)
+            return 200, b"hello", "text/plain; charset=utf-8", {"X-Test": "yes"}
+
+        ext = FakeExtension(routes={"state/now": handler})
+        self.install(FakeEntryPoint("runtime", ext))
+        status, headers, body = self.request("GET", f"/{self.name}/ext/runtime/state/now?a=1&a=2&b=x", headers={"X-Mine": "m"})
+        self.assertEqual((status, body, headers["X-Test"]), (200, b"hello", "yes"))
+        self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
+        self.assertEqual(ext.api.version, 1)
+        request = seen[0]
+        self.assertEqual(request.board_path, os.path.abspath(self.path))
+        self.assertIs(request.local, True)
+        self.assertEqual(request.query, {"a": ["1", "2"], "b": ["x"]})
+        self.assertEqual(request.headers.get("X-Mine"), "m")
+        self.assertEqual(self.request("GET", f"/{self.name}/ext/runtime/missing")[0], 404)
+        self.assertEqual(self.request("GET", f"/{self.name}/ext/nobody/state/now")[0], 404)
+
+    def test_a_script_is_served_and_listed(self):
+        script = os.path.join(self.dir, "runtime.js")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write("window.loaded = true;")
+        self.install(FakeEntryPoint("runtime", FakeExtension(script=script)), FakeEntryPoint("plain", FakeExtension()))
+        self.assertEqual([(e["name"], e["script"]) for e in self.ext_list()["extensions"]], [("plain", False), ("runtime", True)])
+        status, headers, body = self.request("GET", f"/{self.name}/ext/runtime.js")
+        self.assertEqual((status, body), (200, b"window.loaded = true;"))
+        self.assertTrue(headers["Content-Type"].startswith("text/javascript"))
+        self.assertEqual(self.request("GET", f"/{self.name}/ext/plain.js")[0], 404)
+
+    def test_a_foreign_host_never_reaches_a_handler(self):
+        calls = []
+        self.install(FakeEntryPoint("runtime", FakeExtension(routes={"state": lambda r: calls.append(r) or (200, b"", "text/plain", {})})))
+        status, _, _ = self.request("GET", f"/{self.name}/ext/runtime/state", headers={"Host": "evil.example"})
+        self.assertEqual((status, calls), (403, []))
+        self.assertEqual(self.request("GET", f"/{self.name}/api/ext", headers={"Host": "evil.example"})[0], 403)
+
+    def test_a_forwarded_request_is_not_local(self):
+        seen = []
+        self.install(FakeEntryPoint("runtime", FakeExtension(routes={"state": lambda r: seen.append(r.local) or (200, b"", "text/plain", {})})))
+        self.request("GET", f"/{self.name}/ext/runtime/state", headers={"X-Forwarded-For": "203.0.113.9"})
+        self.request("GET", f"/{self.name}/ext/runtime/state")
+        self.assertEqual(seen, [False, True])
+
+    def test_only_get_reaches_a_handler(self):
+        calls = []
+        self.install(FakeEntryPoint("runtime", FakeExtension(routes={"state": lambda r: calls.append(r) or (200, b"", "text/plain", {})})))
+        for method in ("POST", "PUT", "DELETE"):
+            with self.subTest(method=method):
+                status, _, _ = self.request(method, f"/{self.name}/ext/runtime/state", body="{}", headers={"Content-Type": "application/json"})
+                self.assertGreaterEqual(status, 400)
+        self.assertEqual(calls, [])
+
+    def test_a_failing_register_does_not_stop_kanvas(self):
+        broken = FakeExtension(error=RuntimeError("boom"))
+        self.install(FakeEntryPoint("broken", broken), FakeEntryPoint("unloadable", error=ImportError("gone")),
+                     FakeEntryPoint("good", FakeExtension()))
+        with mock.patch("sys.stderr", io.StringIO()) as err:
+            names = [e["name"] for e in self.ext_list()["extensions"]]
+        self.assertEqual(names, ["good"])
+        self.assertEqual(err.getvalue().count("\n"), 2)
+        self.assertEqual(self.request("GET", self.api)[0], 200)
+        self.assertEqual(self.request("GET", f"/{self.name}/ext/broken/state")[0], 404)
+
+    def test_a_failing_handler_gives_500_and_the_server_goes_on(self):
+        def handler(request):
+            raise RuntimeError("boom")
+
+        self.install(FakeEntryPoint("runtime", FakeExtension(routes={"state": handler, "odd": lambda r: "not a tuple"})))
+        with mock.patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(self.request("GET", f"/{self.name}/ext/runtime/state")[0], 500)
+            self.assertEqual(self.request("GET", f"/{self.name}/ext/runtime/odd")[0], 500)
+        self.assertEqual(err.getvalue().count("\n"), 2)
+        self.assertEqual(self.request("GET", self.api)[0], 200)
+
+
 class RememberTests(TempBoard):
     """A Kanvas started again reopens the boards and the phone access it had."""
 
