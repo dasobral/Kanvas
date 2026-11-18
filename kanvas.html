@@ -2851,6 +2851,7 @@ function fillCard(el, t) {
     store.readOnly ? null : h("div", { class: "handle in", title: "Drag onto another card: this card will depend on that one" }),
     store.readOnly ? null : h("div", { class: "handle out", title: "Drag onto another card: that card will depend on this one" }),
   ));
+  extensionSlots("card", t, el);
 }
 
 // A lane's stub says how many finished tasks it folds away, or shows, and flashes when one more folds into it.
@@ -3630,6 +3631,7 @@ function kanbanCard(t) {
   cardFoot(t));
   el.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/kanvas-id", t.id); e.dataTransfer.effectAllowed = "move"; el.classList.add("dragging"); });
   el.addEventListener("dragend", () => el.classList.remove("dragging"));
+  extensionSlots("card", t, el);
   return el;
 }
 
@@ -4080,6 +4082,7 @@ function fillPanel(panel, t) {
   );
   for (const ta of panel.querySelectorAll("textarea")) autosize(ta);
   for (const a of panel.querySelectorAll("a.tref")) a.addEventListener("click", (e) => { e.preventDefault(); select(a.dataset.ref); });
+  extensionSlots("panel", t, panel.querySelector(".p-body"));
 }
 
 function editDesc() { ui.editingDesc = true; ui.focusDesc = true; drafts.descBase = get(ui.selected)?.desc ?? null; renderPanel(); }
@@ -5964,6 +5967,44 @@ function toggleDone() {
   render();
 }
 
+// ---------------------------------------------------------------------------
+// Extensions: scripts the server lists in api/ext, which draw into a slot of each card and of the task panel
+// ---------------------------------------------------------------------------
+
+const extensionListeners = { __proto__: null, card: [], panel: [] };
+
+// What an extension's script uses. `on("card" | "panel", fn)` calls fn(task, slot) each time a card or the task
+// panel is drawn: `slot` is a new empty element for that extension, and `task` is a copy.
+window.Kanvas = {
+  api: 1,
+  on(event, fn) {
+    if (extensionListeners[event] && typeof fn === "function") extensionListeners[event].push({ name: document.currentScript?.dataset.ext || "", fn });
+  },
+  rerender: () => render(),
+};
+
+// A listener that throws is logged and stops nothing.
+function extensionSlots(event, t, parent) {
+  const slots = new Map();
+  for (const { name, fn } of extensionListeners[event]) {
+    if (!slots.has(name)) slots.set(name, parent.appendChild(h("div", { class: "ext-slot", "data-ext": name })));
+    try { fn(clone(t), slots.get(name)); } catch (e) { console.error(`Kanvas: extension ${name} failed`, e); }
+  }
+}
+
+// Only a board served by Kanvas has extensions: a file opened in the browser and a snapshot have none.
+async function loadExtensions() {
+  try {
+    const r = await fetch("api/ext");
+    if (!r.ok) return;
+    for (const e of (await r.json()).extensions) {
+      if (e.script) document.head.append(h("script", { src: `ext/${encodeURIComponent(e.name)}.js`, "data-ext": e.name }));
+    }
+  } catch (e) {
+    console.warn("Kanvas: no extensions", e);
+  }
+}
+
 // Whether leaving the page now loses work: a save on its way, a board that lives only in this tab, or typed text
 // (drafts in the panel, text a failed save gave back, a title being edited, a dialog being filled in).
 function unsaved() {
@@ -5991,7 +6032,7 @@ async function boot() {
   const snap = document.getElementById("kanvas-snapshot");
   try {
     if (snap.textContent.trim()) await open(snapshotStore(snap));
-    else if (location.protocol.startsWith("http")) await open(serverStore());
+    else if (location.protocol.startsWith("http")) { await open(serverStore()); loadExtensions(); }
   } catch (e) {
     console.warn("Kanvas: no board from the page or server", e);
   }

@@ -9,6 +9,7 @@ names the browser to use (a command or a path); when it is set, a missing browse
 import base64
 import json
 import os
+import pathlib
 import re
 import shutil
 import socket
@@ -760,6 +761,80 @@ class BrowserSmokeTests(unittest.TestCase):
         text = self.wait_for("the edited note after retry", lambda: next((n for n in self.notes("BE-02") if 'kanvas-files/' in n), None))
         self.assertEqual(text.count('![login form]'), 1)
         self.until("the editor closed after success", f"!{NOTE_EDITOR}")
+
+    def install_extension(self, script):
+        """Restarts the server with an extension `probe`, installed as a package, whose page script is `script`."""
+        ext = os.path.join(self.dir, "ext")
+        info = os.path.join(ext, "kanvas_probe-1.0.dist-info")
+        os.makedirs(info)
+        files = {
+            os.path.join(info, "METADATA"): "Metadata-Version: 2.1\nName: kanvas-probe\nVersion: 1.0\n",
+            os.path.join(info, "entry_points.txt"): "[kanvas.extensions]\nprobe = kanvas_probe\n",
+            os.path.join(ext, "kanvas_probe.py"): "import os\n__version__ = '1.0'\n\n\ndef register(api):\n"
+                                                  "    api.add_script(os.path.join(os.path.dirname(__file__), 'probe.js'))\n",
+            os.path.join(ext, "probe.js"): script,
+        }
+        for path, text in files.items():
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        stop(self.server)
+        self.env["PYTHONPATH"] = ext
+        self.url = self.start_server()
+
+    def test_the_page_offers_its_extension_api_and_loads_nothing_without_extensions(self):
+        self.load()
+        self.assertEqual(self.page.js("window.Kanvas.api"), 1)
+        self.assertEqual(self.page.js("document.querySelectorAll('script[data-ext], .ext-slot').length"), 0)
+        self.assertEqual(self.page.logged(), [])
+
+    def test_an_extension_script_draws_into_its_slot_of_each_card_and_of_the_panel(self):
+        self.install_extension("""
+            window.probe = { cards: 0, panels: [] };
+            Kanvas.on("card", (task, slot) => { window.probe.cards++; slot.append("probe " + task.id); });
+            Kanvas.on("card", (task, slot) => { slot.append(" again"); });
+            Kanvas.on("panel", (task, slot) => { window.probe.panels.push(task.id); slot.append("panel " + task.id); });
+            Kanvas.rerender();
+        """)
+        self.load()
+        slot = "document.querySelector('[data-id=\"BE-03\"] .ext-slot[data-ext=\"probe\"]')"
+        self.until("the extension's script", "document.querySelectorAll('script[data-ext]').length === 1 && !!window.probe")
+        self.until("the slot on a card", f"{slot}?.textContent === 'probe BE-03 again'")
+        self.assertEqual(self.page.js("document.querySelectorAll('[data-id=\"BE-03\"] .ext-slot').length"), 1)
+
+        self.open_task("BE-03")
+        self.until("the slot in the panel", "document.querySelector('#panel .ext-slot')?.textContent === 'panel BE-03'")
+
+        # Drawing again gives each listener a new empty slot.
+        drawn = self.page.js("window.probe.cards")
+        self.page.js("Kanvas.rerender()")
+        self.until("the cards drawn again", f"window.probe.cards > {drawn}")
+        self.assertEqual(self.page.js(f"{slot}.textContent"), "probe BE-03 again")
+        self.assertEqual(self.page.js("document.querySelectorAll('#panel .ext-slot').length"), 1)
+
+        self.page.js("document.querySelector('#view-board').click()")
+        self.until("the slot on a card of the board view",
+                   "document.querySelector('#kanban [data-id=\"BE-03\"] .ext-slot')?.textContent === 'probe BE-03 again'")
+        self.assertEqual(self.page.logged(), [])
+
+    def test_an_extension_that_throws_is_logged_and_the_board_still_draws(self):
+        self.install_extension("""
+            Kanvas.on("card", () => { throw new Error("probe broke"); });
+            Kanvas.on("panel", () => { throw new Error("probe broke"); });
+            Kanvas.rerender();
+        """)
+        self.load()
+        self.until("the failure in the console", "!!document.querySelector('script[data-ext=\"probe\"]')")
+        self.wait_for("the logged failure", lambda: any("extension probe failed" in e for e in self.page.logged()))
+        self.open_task("BE-03")
+        self.assertTrue(self.page.js("!!document.querySelector('[data-id=\"BE-03\"] .card-title')"))
+        self.assertTrue(all("extension probe failed" in e for e in self.page.logged()), self.page.errors)
+
+    def test_a_page_opened_as_a_file_asks_for_no_extensions(self):
+        self.page.send("Page.navigate", url=pathlib.Path(ROOT, "kanvas.html").as_uri())
+        self.until("the welcome screen", "document.readyState === 'complete' && !document.querySelector('#welcome').hidden")
+        self.assertEqual(self.page.js("window.Kanvas.api"), 1)
+        self.assertEqual(self.page.js("document.querySelectorAll('script[data-ext]').length"), 0)
+        self.assertEqual(self.page.logged(), [])
 
     def test_a_failed_save_gives_the_typed_note_back(self):
         self.load("#BE-03")

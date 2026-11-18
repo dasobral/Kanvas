@@ -14,6 +14,7 @@ import argparse
 import base64
 import errno
 import hashlib
+import importlib.metadata
 import ipaddress
 import json
 import os
@@ -34,7 +35,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 VERSION = "0.5.0"
 FORMAT = 1
@@ -2351,6 +2352,77 @@ class BoardServer(ThreadingHTTPServer):
         return out
 
 
+# ---------------------------------------------------------------------------
+# Extensions
+# ---------------------------------------------------------------------------
+
+EXT_API = 1
+EXT_GROUP = "kanvas.extensions"
+EXT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_extensions = None
+_extensions_lock = threading.Lock()
+
+
+class ExtensionApi:
+    """What an extension's `register(api)` gets. Version 1 serves `GET` routes and one script for the page."""
+
+    version = EXT_API
+
+    def __init__(self, version):
+        self.ext_version, self.routes, self.script = version, {}, None
+
+    def add_route(self, subpath, handler):
+        """Serve `GET /<board>/ext/<name>/<subpath>`: `handler(request)` returns (status, body, content type, headers)."""
+        self.routes[subpath.strip("/")] = handler
+
+    def add_script(self, path):
+        """Serve the file at `path` as `GET /<board>/ext/<name>.js`; the page loads it."""
+        self.script = path
+
+
+class ExtensionRequest:
+    """A request to an extension route: the board's file, whether it comes from this computer, query and headers."""
+
+    def __init__(self, board_path, local, query, headers):
+        self.board_path, self.local, self.query, self.headers = board_path, local, query, headers
+
+
+def extension_warning(name, what, error):
+    print(f"Kanvas: extension {name} {what}: {error}", file=sys.stderr)
+
+
+def extensions():
+    """The installed extensions by name, loaded once per process. A broken extension is left out; Kanvas goes on."""
+    global _extensions
+    with _extensions_lock:
+        if _extensions is None:
+            try:
+                # Python 3.10 selects the group; 3.8 and 3.9 return every group in a dictionary.
+                try:
+                    found = importlib.metadata.entry_points(group=EXT_GROUP)
+                except TypeError:
+                    found = importlib.metadata.entry_points().get(EXT_GROUP, ())
+                found = sorted(found, key=lambda ep: ep.name)
+            except Exception as e:
+                extension_warning("discovery", "failed", e)
+                found = []
+            loaded = {}
+            for ep in found:
+                if not EXT_NAME.match(ep.name):
+                    extension_warning(ep.name, "skipped", "its name must match " + EXT_NAME.pattern)
+                    continue
+                try:
+                    module = ep.load()
+                    api = ExtensionApi(str(getattr(module, "__version__", "")))
+                    module.register(api)
+                except Exception as e:
+                    extension_warning(ep.name, "failed to load", e)
+                    continue
+                loaded[ep.name] = api
+            _extensions = loaded
+        return _extensions
+
+
 class BoardHandler(BaseHTTPRequestHandler):
     server_version = "Kanvas/" + VERSION
 
@@ -2492,7 +2564,35 @@ class BoardHandler(BaseHTTPRequestHandler):
             return self._send(200, data, headers={"ETag": tag})
         if len(rest) == 2 and rest[0] == FILES_DIR:
             return self._image(path, f"{FILES_DIR}/{rest[1]}")
+        if rest == ["api", "ext"]:
+            found = [{"name": name, "version": ext.ext_version, "script": bool(ext.script)} for name, ext in extensions().items()]
+            return self._send(200, json.dumps({"api": EXT_API, "extensions": found}).encode("utf-8"))
+        if rest[0] == "ext" and len(rest) > 1:
+            return self._extension(path, rest[1:])
         return self._error(404, "Not found")
+
+    def _extension(self, board, parts):
+        """A route or the script of an extension. An extension that fails answers 500 and stops nothing."""
+        if len(parts) == 1 and parts[0].endswith(".js"):
+            ext = extensions().get(parts[0][:-3])
+            try:
+                with open(ext.script, "rb") as f:
+                    return self._send(200, f.read(), "text/javascript; charset=utf-8")
+            except (AttributeError, TypeError, OSError):
+                return self._error(404, "Not found")
+        ext = extensions().get(parts[0])
+        handler = ext and ext.routes.get("/".join(parts[1:]))
+        if not handler:
+            return self._error(404, "Not found")
+        try:
+            request = ExtensionRequest(board, self._from_this_computer(), parse_qs(urlparse(self.path).query), self.headers)
+            status, body, ctype, headers = handler(request)
+            if not isinstance(body, (bytes, bytearray)):
+                raise TypeError("the body must be bytes")
+            return self._send(int(status), bytes(body), str(ctype), dict(headers or {}))
+        except Exception as e:
+            extension_warning(parts[0], "failed", e)
+            return self._error(500, "Extension failed")
 
     def _image(self, board, ref):
         """An image of the board. Its name is a hash of its bytes, so it never changes and browsers keep it."""
